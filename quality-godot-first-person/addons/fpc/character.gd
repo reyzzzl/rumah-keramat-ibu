@@ -1,0 +1,394 @@
+extends CharacterBody3D
+
+@export_category("Character")
+@export var base_speed : float = 50.0
+@export var sprint_speed : float = 6.0
+@export var crouch_speed : float = 1.0
+@export var acceleration : float = 10.0
+@export var jump_velocity : float = 4.5
+@export var mouse_sensitivity : float = 0.1
+@export var invert_camera_x_axis : bool = false
+@export var invert_camera_y_axis : bool = false
+@export var immobile : bool = false
+@export_file var default_reticle
+
+@export_group("Nodes")
+@export var HEAD : Node3D
+@export var CAMERA : Camera3D
+@export var HEADBOB_ANIMATION : AnimationPlayer
+@export var JUMP_ANIMATION : AnimationPlayer
+@export var CROUCH_ANIMATION : AnimationPlayer
+@export var COLLISION_MESH : CollisionShape3D
+
+@export_group("Controls")
+@export var controls : Dictionary = {
+	LEFT = "ui_left",
+	RIGHT = "ui_right",
+	FORWARD = "ui_up",
+	BACKWARD = "ui_down",
+	JUMP = "ui_accept",
+	CROUCH = "crouch",
+	SPRINT = "sprint",
+	PAUSE = "ui_cancel"
+	}
+@export_subgroup("Controller Specific")
+@export var controller_support : bool = false
+@export var controller_controls : Dictionary = {
+	LOOK_LEFT = "look_left",
+	LOOK_RIGHT = "look_right",
+	LOOK_UP = "look_up",
+	LOOK_DOWN = "look_down"
+	}
+@export_range(0.001, 0.1, 0.001) var look_sensitivity : float = 0.035
+
+@export_group("Feature Settings")
+@export var jumping_enabled : bool = true
+@export var in_air_momentum : bool = true
+@export var motion_smoothing : bool = true
+@export var sprint_enabled : bool = true
+@export_enum("Hold to Sprint", "Toggle Sprint") var sprint_mode : int = 0
+@export var crouch_enabled : bool = true
+@export_enum("Hold to Crouch", "Toggle Crouch") var crouch_mode : int = 0
+@export var dynamic_fov : bool = true
+@export var continuous_jumping : bool = true
+@export var view_bobbing : bool = true
+@export var view_tilting : bool = false
+@export var jump_animation : bool = true
+@export var pausing_enabled : bool = true
+@export var gravity_enabled : bool = true
+
+var speed : float = base_speed
+var current_speed : float = 0.0
+var state : String = "normal"
+var low_ceiling : bool = false 
+var was_on_floor : bool = true 
+
+var RETICLE : Control
+var mouse_input : Vector2 = Vector2(0,0)
+var input_dir : Vector2 = Vector2.ZERO
+var moving : bool = false
+
+func _ready() -> void:
+	_add_action_if_missing("ui_up", KEY_W)
+	_add_action_if_missing("ui_down", KEY_S)
+	_add_action_if_missing("ui_left", KEY_A)
+	_add_action_if_missing("ui_right", KEY_D)
+	_add_action_if_missing("ui_accept", KEY_SPACE)
+	_add_action_if_missing("ui_cancel", KEY_ESCAPE)
+	_add_action_if_missing("sprint", KEY_SHIFT)
+	_add_action_if_missing("crouch", KEY_CTRL)
+
+	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+	HEAD.rotation.y = rotation.y
+	rotation.y = 0
+
+	if default_reticle:
+		change_reticle(default_reticle)
+
+	_initialize_animations()
+	_check_controls()
+	_enter_normal_state()
+
+	if OS.get_name() == "Web":
+		Input.set_use_accumulated_input(false)
+
+func _add_action_if_missing(action_name: String, key: Key) -> void:
+	if not InputMap.has_action(action_name):
+		InputMap.add_action(action_name)
+		var event = InputEventKey.new()
+		event.keycode = key
+		InputMap.action_add_event(action_name, event)
+
+func _process(_delta : float) -> void:
+	if pausing_enabled:
+		_handle_pausing()
+
+	_update_debug_menu_per_frame()
+
+func _physics_process(delta : float) -> void:
+	if not is_on_floor() and gravity_enabled:
+		velocity += get_gravity() * delta
+
+	_handle_jumping()
+
+	input_dir = Vector2.ZERO
+
+	if not immobile: 
+		input_dir = Input.get_vector(controls.LEFT, controls.RIGHT, controls.FORWARD, controls.BACKWARD)
+
+	moving = input_dir != Vector2.ZERO
+
+	_handle_movement(delta, input_dir)
+	current_speed = Vector3.ZERO.distance_to(get_real_velocity())
+
+	_handle_head_rotation(delta)
+
+	low_ceiling = $CrouchCeilingDetection.is_colliding()
+
+	_handle_state(moving)
+	if dynamic_fov: 
+		_update_camera_fov()
+
+	if view_bobbing:
+		_play_headbob_animation(moving)
+
+	if jump_animation:
+		_play_jump_animation()
+
+	_update_debug_menu_per_tick()
+
+	was_on_floor = is_on_floor() 
+
+func _handle_jumping() -> void:
+	if jumping_enabled:
+		if continuous_jumping: 
+			if Input.is_action_pressed(controls.JUMP) and is_on_floor() and !low_ceiling:
+				if jump_animation:
+					JUMP_ANIMATION.play("jump", 0.25)
+				velocity.y += jump_velocity 
+		else:
+			if Input.is_action_just_pressed(controls.JUMP) and is_on_floor() and !low_ceiling:
+				if jump_animation:
+					JUMP_ANIMATION.play("jump", 0.25)
+				velocity.y += jump_velocity
+
+func _handle_movement(delta : float, input_dir : Vector2) -> void:
+	var direction2D := input_dir.rotated(-HEAD.rotation.y)
+	var direction3D := Vector3(direction2D.x, 0, direction2D.y)
+	move_and_slide()
+
+	if in_air_momentum:
+		if is_on_floor():
+			if motion_smoothing:
+				velocity.x = lerp(velocity.x, direction3D.x * speed, acceleration * delta)
+				velocity.z = lerp(velocity.z, direction3D.z * speed, acceleration * delta)
+			else:
+				velocity.x = direction3D.x * speed
+				velocity.z = direction3D.z * speed
+	else:
+		if motion_smoothing:
+			velocity.x = lerp(velocity.x, direction3D.x * speed, acceleration * delta)
+			velocity.z = lerp(velocity.z, direction3D.z * speed, acceleration * delta)
+		else:
+			velocity.x = direction3D.x * speed
+			velocity.z = direction3D.z * speed
+
+func _handle_head_rotation(delta : float) -> void:
+	if invert_camera_x_axis:
+		HEAD.rotation_degrees.y -= mouse_input.x * mouse_sensitivity * -1
+	else:
+		HEAD.rotation_degrees.y -= mouse_input.x * mouse_sensitivity
+
+	if invert_camera_y_axis:
+		HEAD.rotation_degrees.x -= mouse_input.y * mouse_sensitivity * -1
+	else:
+		HEAD.rotation_degrees.x -= mouse_input.y * mouse_sensitivity
+
+	if controller_support:
+		var controller_view_rotation = Input.get_vector(controller_controls.LOOK_DOWN, controller_controls.LOOK_UP, controller_controls.LOOK_RIGHT, controller_controls.LOOK_LEFT) * look_sensitivity 
+		if invert_camera_y_axis:
+			HEAD.rotation.x += controller_view_rotation.x * -1
+		else:
+			HEAD.rotation.x += controller_view_rotation.x
+
+		if invert_camera_x_axis:
+			HEAD.rotation.y += controller_view_rotation.y * -1
+		else:
+			HEAD.rotation.y += controller_view_rotation.y
+
+	if view_tilting:
+			var target_tilt : float = clamp(
+			mouse_input.x * mouse_sensitivity * -1.0 * 1.5,
+			-5.0,
+			5.0
+		)
+			HEAD.rotation_degrees.z = lerpf(
+			HEAD.rotation_degrees.z,
+			target_tilt,
+			1.0 - exp(-12.0 * delta) 
+		)
+
+	mouse_input = Vector2.ZERO
+	HEAD.rotation_degrees.x = clamp(HEAD.rotation_degrees.x, -90, 90)
+
+func _check_controls() -> void: 
+	if !InputMap.has_action(controls.JUMP):
+		push_error("No control mapped for jumping. Please add an input map control. Disabling jump.")
+		jumping_enabled = false
+	if !InputMap.has_action(controls.LEFT):
+		push_error("No control mapped for move left. Please add an input map control. Disabling movement.")
+		immobile = true
+	if !InputMap.has_action(controls.RIGHT):
+		push_error("No control mapped for move right. Please add an input map control. Disabling movement.")
+		immobile = true
+	if !InputMap.has_action(controls.FORWARD):
+		push_error("No control mapped for move forward. Please add an input map control. Disabling movement.")
+		immobile = true
+	if !InputMap.has_action(controls.BACKWARD):
+		push_error("No control mapped for move backward. Please add an input map control. Disabling movement.")
+		immobile = true
+	if !InputMap.has_action(controls.PAUSE):
+		push_error("No control mapped for pause. Please add an input map control. Disabling pausing.")
+		pausing_enabled = false
+	if !InputMap.has_action(controls.CROUCH):
+		push_error("No control mapped for crouch. Please add an input map control. Disabling crouching.")
+		crouch_enabled = false
+	if !InputMap.has_action(controls.SPRINT):
+		push_error("No control mapped for sprint. Please add an input map control. Disabling sprinting.")
+		sprint_enabled = false
+
+func _handle_state(moving : bool) -> void:
+	if sprint_enabled:
+		if sprint_mode == 0:
+			if Input.is_action_pressed(controls.SPRINT) and state != "crouching":
+				if moving:
+					if state != "sprinting":
+						_enter_sprint_state()
+				else:
+					if state == "sprinting":
+						_enter_normal_state()
+			elif state == "sprinting":
+				_enter_normal_state()
+		elif sprint_mode == 1:
+			if moving:
+				if Input.is_action_pressed(controls.SPRINT) and state == "normal":
+					_enter_sprint_state()
+				if Input.is_action_just_pressed(controls.SPRINT):
+					match state:
+						"normal":
+							_enter_sprint_state()
+						"sprinting":
+							_enter_normal_state()
+			elif state == "sprinting":
+				_enter_normal_state()
+
+	if crouch_enabled:
+		if crouch_mode == 0:
+			if Input.is_action_pressed(controls.CROUCH) and state != "sprinting":
+				if state != "crouching":
+					_enter_crouch_state()
+			elif state == "crouching" and !$CrouchCeilingDetection.is_colliding():
+				_enter_normal_state()
+		elif crouch_mode == 1:
+			if Input.is_action_just_pressed(controls.CROUCH):
+				match state:
+					"normal":
+						_enter_crouch_state()
+					"crouching":
+						if !$CrouchCeilingDetection.is_colliding():
+							_enter_normal_state()
+
+func _enter_normal_state() -> void:
+	var prev_state = state
+	if prev_state == "crouching":
+		CROUCH_ANIMATION.play_backwards("crouch")
+	state = "normal"
+	speed = base_speed
+
+func _enter_crouch_state() -> void:
+	state = "crouching"
+	speed = crouch_speed
+	CROUCH_ANIMATION.play("crouch")
+
+func _enter_sprint_state() -> void:
+	var prev_state = state
+	if prev_state == "crouching":
+		CROUCH_ANIMATION.play_backwards("crouch")
+	state = "sprinting"
+	speed = sprint_speed
+
+func _initialize_animations() -> void:
+	HEADBOB_ANIMATION.play("RESET")
+	JUMP_ANIMATION.play("RESET")
+	CROUCH_ANIMATION.play("RESET")
+
+func _play_headbob_animation(moving : bool) -> void:
+	if moving and is_on_floor():
+		var use_headbob_animation : String
+		match state:
+			"normal","crouching":
+				use_headbob_animation = "walk"
+			"sprinting":
+				use_headbob_animation = "sprint"
+
+		var was_playing : bool = false
+		if HEADBOB_ANIMATION.current_animation == use_headbob_animation:
+			was_playing = true
+
+		HEADBOB_ANIMATION.play(use_headbob_animation, 0.25)
+		HEADBOB_ANIMATION.speed_scale = (current_speed / base_speed) * 1.75
+		if !was_playing:
+			HEADBOB_ANIMATION.seek(float(randi() % 2)) 
+
+	else:
+		if HEADBOB_ANIMATION.current_animation == "sprint" or HEADBOB_ANIMATION.current_animation == "walk":
+			HEADBOB_ANIMATION.speed_scale = 1
+			HEADBOB_ANIMATION.play("RESET", 1)
+
+func _play_jump_animation() -> void:
+	if !was_on_floor and is_on_floor(): 
+		var facing_direction : Vector3 = CAMERA.get_global_transform().basis.x
+		var facing_direction_2D : Vector2 = Vector2(facing_direction.x, facing_direction.z).normalized()
+		var velocity_2D : Vector2 = Vector2(velocity.x, velocity.z).normalized()
+
+		var side_landed : int = round(velocity_2D.dot(facing_direction_2D))
+
+		if side_landed > 0:
+			JUMP_ANIMATION.play("land_right", 0.25)
+		elif side_landed < 0:
+			JUMP_ANIMATION.play("land_left", 0.25)
+		else:
+			JUMP_ANIMATION.play("land_center", 0.25)
+
+func _update_debug_menu_per_frame() -> void:
+	if !$UserInterface/DebugPanel.visible: return
+
+	$UserInterface/DebugPanel.add_property("FPS", Performance.get_monitor(Performance.TIME_FPS), 0)
+	var status : String = state
+	if !is_on_floor():
+		status += " in the air"
+	$UserInterface/DebugPanel.add_property("State", status, 4)
+
+func _update_debug_menu_per_tick() -> void:
+	if !$UserInterface/DebugPanel.visible: return
+
+	$UserInterface/DebugPanel.add_property("Speed", snappedf(current_speed, 0.001), 1)
+	$UserInterface/DebugPanel.add_property("Target speed", speed, 2)
+	var cv : Vector3 = get_real_velocity()
+	var vd : Array[float] = [
+		snappedf(cv.x, 0.001),
+		snappedf(cv.y, 0.001),
+		snappedf(cv.z, 0.001)
+	]
+	var readable_velocity : String = "X: " + str(vd[0]) + " Y: " + str(vd[1]) + " Z: " + str(vd[2])
+	$UserInterface/DebugPanel.add_property("Velocity", readable_velocity, 3)
+
+func _unhandled_input(event : InputEvent) -> void:
+	if event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
+		mouse_input = event.screen_relative
+	elif event is InputEventKey:
+		if event.is_released():
+			if event.keycode == 4194338: 
+				$UserInterface/DebugPanel.visible = !$UserInterface/DebugPanel.visible
+
+func change_reticle(reticle) -> void: 
+	if not RETICLE:
+		return
+
+	RETICLE = load(reticle).instantiate()
+	RETICLE.character = self
+	$UserInterface.add_child(RETICLE)
+
+func _update_camera_fov() -> void:
+	if state == "sprinting":
+		CAMERA.fov = lerp(CAMERA.fov, 85.0, 0.3)
+	else:
+		CAMERA.fov = lerp(CAMERA.fov, 75.0, 0.3)
+
+func _handle_pausing() -> void:
+	if Input.is_action_just_pressed(controls.PAUSE):
+		match Input.mouse_mode:
+			Input.MOUSE_MODE_CAPTURED:
+				Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+			Input.MOUSE_MODE_VISIBLE:
+				Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
